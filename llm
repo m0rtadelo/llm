@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+source /Users/ricard/Projects/m0rtadelo/llm/.venv/bin/activate
+exec python3 "$HOME/.config/llm/llm.py" "$@"
