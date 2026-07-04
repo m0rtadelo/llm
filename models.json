@@ -1,0 +1,25 @@
+[
+  {
+    "name": "codellama",
+    "path": "C:\\Users\\you\\models\\codellama-34b.Q4_K_M.gguf",
+    "params": {
+      "-ctk": "q4_0",
+      "-ctv": "q4_0",
+      "--flash-attn": "on",
+      "--reasoning-budget": 256,
+      "temp": 0.2,
+      "ctx-size": 4096,
+      "n-gpu-layers": 35
+    }
+  },
+  {
+    "name": "deepseek-coder",
+    "path": "D:\\models\\deepseek-coder.gguf",
+    "params": {
+      "ctx-size": 8192,
+      "n-gpu-layers": 50,
+      "threads": 8,
+      "temp": 0.1
+    }
+  }
+]

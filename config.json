@@ -1,0 +1,6 @@
+{
+  "llama-server": "C:\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
+  "port": 11434,
+  "host": "0.0.0.0",
+  "idle_timeout": 300
+}
