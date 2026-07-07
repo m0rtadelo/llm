@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+export PATH="/Users/ricard/Projects/m0rtadelo/llama.cpp/build/bin:$PATH"
+source /Users/ricard/Projects/m0rtadelo/llm/.venv/bin/activate
+exec python3 /Users/ricard/Projects/m0rtadelo/llm/llm_tray.py
