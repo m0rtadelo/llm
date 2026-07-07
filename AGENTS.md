@@ -2,18 +2,21 @@
 
 ## Project status
 
-Built and smoke-tested on macOS. Ready to deploy on Windows. Single-file server (`llm.py`).
+Built and smoke-tested on macOS (server + menu bar app). Ready to deploy on Windows. Single-file server (`llm.py`).
 
 ## Target
 
-- **OS**: Windows
+- **OS**: macOS and Windows (cross-platform)
 - **Single script**: `llm.py` (the server)
-- **Wrapper**: `%USERPROFILE%\llm.bat` calling `llm.py`
-- **Config dir**: `%USERPROFILE%\.config\llm\`
+- **Wrappers**:
+  - Windows: `%USERPROFILE%\llm.bat` calling `llm.py`
+  - macOS/Linux: `llm` shell script (activates `.venv`, runs `~/.config/llm/llm.py`)
+- **macOS extras**: `llm_tray.py` (rumps menu bar app), `llm.app` / `llm_service.app` bundles
+- **Config dir**: `~/.config/llm/` (macOS/Linux) or `%USERPROFILE%\.config\llm\` (Windows)
   - `config.json` — server options (port, host, idle_timeout, llama-server binary path). Set `host` to `"0.0.0.0"` to accept remote connections; `"127.0.0.1"` for local-only.
   - `models.json` — array of model definitions, each with `name`, `path`, and `params` (llama.cpp CLI flags per model)
 - **Port**: 11434
-- **Dependencies**: Python 3.10+, `pip install aiohttp`
+- **Dependencies**: Python 3.10+, `pip install aiohttp`; macOS menu bar app also needs `rumps`
 
 ## Architecture
 
@@ -33,7 +36,8 @@ Proxy server that manages `llama-server.exe` as subprocess:
 | `POST /api/chat` | Ollama | Streaming NDJSON: `{ message: { content }, done }` |
 | `POST /api/generate` | Ollama | Ollama generate endpoint |
 | `POST /api/show` | Ollama | Returns model info including context length. Respond with `{ model_info: { "llama.context_length": <ctx-size> }, parameters: "num_ctx <ctx-size>" }` using the model's `params.ctx-size` or a fallback of 4096. Required by ollamaChat. |
-| `GET /api/tags` | Ollama | Returns `{ models: [{ name: string }] }` — names from model config |
+| `GET /api/tags` | Ollama | Returns `{ models: [{ name, size? }] }` — names from model config, size from file when present |
+| `GET /api/version` | Ollama | Returns `{ version }` |
 
 ## Cross-platform
 
