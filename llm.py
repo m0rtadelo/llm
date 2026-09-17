@@ -7,9 +7,11 @@ Usage:
 
 import argparse
 import asyncio
+import errno
 import json
 import logging
 import os
+import signal
 import socket
 import sys
 import time
@@ -222,6 +224,53 @@ class ModelProcess:
         async with self._lock:
             await self._stop_locked()
 
+    async def reset(self):
+        """Force-stop the current model so the next request respawns a fresh one."""
+        logger.warning("Resetting model process (self-heal)")
+        async with self._lock:
+            await self._stop_locked()
+
+    async def health_ok(self):
+        """Return True if the current upstream answers /health, False otherwise."""
+        if not self._is_alive() or self._port is None:
+            return False
+        url = f"http://127.0.0.1:{self._port}/health"
+        try:
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    return resp.status == 200
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+            return False
+
+    async def reset_if_unhealthy(self):
+        """Reset the model only if it is dead or unresponsive, so a single bad
+        request does not tear down a working server."""
+        if self._current_model is None:
+            return
+        if not self._is_alive() or not await self.health_ok():
+            await self.reset()
+
+    async def watchdog(self):
+        """Periodically verify the loaded model is responsive and reset it if it
+        gets stuck (e.g. after a transient network/system hiccup)."""
+        interval = self.config.get("watchdog_interval", 15)
+        threshold = self.config.get("watchdog_failures", 3)
+        fails = 0
+        while True:
+            await asyncio.sleep(interval)
+            if self._current_model is None or not self._is_alive():
+                fails = 0
+                continue
+            if await self.health_ok():
+                fails = 0
+                continue
+            fails += 1
+            logger.warning("Upstream health check failed (%d/%d)", fails, threshold)
+            if fails >= threshold:
+                logger.error("Upstream unresponsive; resetting model")
+                await self.reset()
+                fails = 0
+
     async def _stop_locked(self):
         if self._idle_timer:
             self._idle_timer.cancel()
@@ -372,7 +421,9 @@ class Server:
             url = f"http://127.0.0.1:{port}/v1/chat/completions"
             openai_body = ollama_chat_body_to_openai(body)
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=15)
+            ) as sess:
                 upstream = await self._call_upstream(sess, url, openai_body)
                 async with upstream:
                     if upstream.status != 200:
@@ -392,6 +443,7 @@ class Server:
             return web.json_response({"error": "connection reset"}, status=499)
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
             logger.error("Upstream error in api/chat: %s", exc)
+            await self.mp.reset_if_unhealthy()
             return web.json_response({"error": f"upstream error: {exc}"}, status=502)
         finally:
             self.mp.release()
@@ -415,7 +467,9 @@ class Server:
                 "stream": stream,
             }
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=15)
+            ) as sess:
                 upstream = await self._call_upstream(sess, url, openai_body)
                 async with upstream:
                     if upstream.status != 200:
@@ -435,6 +489,7 @@ class Server:
             return web.json_response({"error": "connection reset"}, status=499)
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
             logger.error("Upstream error in api/generate: %s", exc)
+            await self.mp.reset_if_unhealthy()
             return web.json_response({"error": f"upstream error: {exc}"}, status=502)
         finally:
             self.mp.release()
@@ -450,7 +505,9 @@ class Server:
                 return port
             url = f"http://127.0.0.1:{port}{path}"
 
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None)) as sess:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_connect=15)
+            ) as sess:
                 async with sess.post(url, json=body) as upstream:
                     resp = web.StreamResponse(
                         status=upstream.status,
@@ -472,6 +529,7 @@ class Server:
             return web.json_response({"error": "connection reset"}, status=499)
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
             logger.error("Upstream error in proxy: %s", exc)
+            await self.mp.reset_if_unhealthy()
             return web.json_response({"error": f"upstream error: {exc}"}, status=502)
         finally:
             self.mp.release()
@@ -547,6 +605,21 @@ def create_app(config, models):
     app.on_response_prepare.append(cors_headers)
     app.on_shutdown.append(lambda _: sv.mp.stop())
 
+    async def _start_watchdog(app):
+        app["watchdog"] = asyncio.create_task(sv.mp.watchdog())
+
+    async def _stop_watchdog(app):
+        task = app.get("watchdog")
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.on_startup.append(_start_watchdog)
+    app.on_cleanup.append(_stop_watchdog)
+
     app.router.add_get("/api/tags", sv.handle_api_tags)
     app.router.add_post("/api/tags", sv.handle_api_tags)
     app.router.add_get("/api/version", sv.handle_api_version)
@@ -559,13 +632,68 @@ def create_app(config, models):
     return app
 
 
+# Transient OS network errors that must not crash the event loop: the interface
+# went down/changed (sleep/wake, VPN, WiFi drop). We log and keep running.
+_BENIGN_NET_ERRNOS = {
+    errno.ENETDOWN, errno.ENETUNREACH, errno.ENETRESET, errno.ECONNABORTED,
+    errno.EHOSTDOWN, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL, errno.ENOTCONN,
+    errno.EPIPE,
+}
+
+
 def _suppress_pipe_errors(loop, context):
     exc = context.get("exception")
     msg = context.get("message", "")
     if isinstance(exc, ConnectionResetError) and "connection_lost" in msg:
         logger.debug("Suppressed pipe transport error (benign Windows cleanup)")
         return
+    if isinstance(exc, OSError) and exc.errno in _BENIGN_NET_ERRNOS:
+        logger.warning("Transient network error in event loop (%s); continuing", exc)
+        return
     loop.default_exception_handler(context)
+
+
+async def _serve(config, models):
+    """Run the server with a supervisor that rebinds the listening socket if the
+    network device is unavailable (e.g. after a transient network failure)."""
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_suppress_pipe_errors)
+
+    app = create_app(config, models)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host, port = config["host"], config["port"]
+
+    stop = asyncio.Event()
+    for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None)):
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            pass  # Windows / unsupported
+
+    backoff = 1
+    try:
+        while not stop.is_set():
+            site = web.TCPSite(runner, host, port, reuse_address=True)
+            try:
+                await site.start()
+            except OSError as exc:
+                logger.error(
+                    "Failed to bind %s:%d (%s); retrying in %ds", host, port, exc, backoff
+                )
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 30)
+                continue
+            logger.info("Listening on %s:%d", host, port)
+            backoff = 1
+            await stop.wait()
+    finally:
+        await runner.cleanup()
 
 
 def main():
@@ -587,11 +715,10 @@ def main():
         config["port"] = args.port
 
     logger.info("Starting llm on %s:%d", config["host"], config["port"])
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.set_exception_handler(_suppress_pipe_errors)
-    app = create_app(config, models)
-    web.run_app(app, host=config["host"], port=config["port"], loop=loop)
+    try:
+        asyncio.run(_serve(config, models))
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":
