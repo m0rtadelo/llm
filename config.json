@@ -3,5 +3,7 @@
   "llama-params": [],
   "port": 11434,
   "host": "0.0.0.0",
-  "idle_timeout": 300
+  "idle_timeout": 300,
+  "load_timeout": 600,
+  "llama_log_level": "info"
 }

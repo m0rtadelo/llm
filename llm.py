@@ -7,10 +7,12 @@ Usage:
 
 import argparse
 import asyncio
+import collections
 import errno
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import sys
@@ -30,7 +32,11 @@ DEFAULT_CONFIG = {
     "port": 11434,
     "host": "0.0.0.0",
     "idle_timeout": 300,
+    "load_timeout": 600,
+    "llama_log_level": "info",
 }
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def load_config():
@@ -158,6 +164,7 @@ class ModelProcess:
         self._lock = asyncio.Lock()
         self._ready_event = asyncio.Event()
         self._active_requests = 0
+        self._stderr_task = None
 
     def find_model(self, name):
         return self._model_index.get(name)
@@ -180,16 +187,37 @@ class ModelProcess:
             port = find_free_port()
             cmd = self._build_cmd(model, port)
             logger.info("Spawning %s on port %d", model_name, port)
-            self._process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
+            logger.debug("Command: %s", " ".join(cmd))
+
+            try:
+                self._process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+            except FileNotFoundError as exc:
+                raise RuntimeError(
+                    f"'{cmd[0]}' not found; check \"llama-server\" in config.json"
+                ) from exc
+            except OSError as exc:
+                raise RuntimeError(f"failed to start '{cmd[0]}': {exc}") from exc
+
+            # Drain stderr from the very first moment: llama-server writes a lot
+            # of output while loading and blocks if the pipe buffer fills up.
+            tail = collections.deque(maxlen=40)
+            self._stderr_task = asyncio.create_task(
+                self._drain_stderr(self._process, tail)
             )
-            await self._wait_ready(port)
+            try:
+                await self._wait_ready(port, self._process, tail)
+            except BaseException:
+                await self._stop_locked()
+                raise
+
             self._port = port
             self._current_model = model_name
             self._reset_idle()
-            asyncio.create_task(self._pipe_stderr())
             return port
 
     def _is_alive(self):
@@ -221,19 +249,57 @@ class ModelProcess:
                 cmd.extend([flag, str(value)])
         return cmd
 
-    async def _wait_ready(self, port, timeout=60):
+    async def _wait_ready(self, port, proc, tail):
+        """Wait until llama-server reports healthy.
+
+        Fails fast with the child's own output when it dies (bad flag, missing
+        model file, OOM, ...) instead of polling a dead process until timeout.
+        """
+        timeout = self.config.get("load_timeout", 600)
         url = f"http://127.0.0.1:{port}/health"
         deadline = time.monotonic() + timeout
         last_error = None
-        while time.monotonic() < deadline:
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(url, timeout=aiohttp.ClientTimeout(total=2)):
-                        return
-            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                last_error = exc
+
+        async with aiohttp.ClientSession() as sess:
+            while time.monotonic() < deadline:
+                if proc.returncode is not None:
+                    await self._await_stderr_drain()
+                    raise RuntimeError(
+                        f"llama-server exited with code {proc.returncode}: "
+                        f"{self._tail_text(tail)}"
+                    )
+                try:
+                    async with sess.get(
+                        url, timeout=aiohttp.ClientTimeout(total=2)
+                    ) as resp:
+                        if resp.status == 200:
+                            logger.info("Model ready on port %d", port)
+                            return
+                        if resp.status != 503:
+                            last_error = f"HTTP {resp.status}"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    last_error = exc
                 await asyncio.sleep(0.5)
-        raise TimeoutError(f"Model not ready after {timeout}s — {last_error}")
+
+        await self._await_stderr_drain()
+        raise TimeoutError(
+            f"model not ready after {timeout}s ({last_error}); "
+            f"{self._tail_text(tail)}"
+        )
+
+    @staticmethod
+    def _tail_text(tail):
+        lines = [line for line in tail if line][-8:]
+        return " | ".join(lines) if lines else "no output from llama-server"
+
+    async def _await_stderr_drain(self, wait=1.0):
+        task = self._stderr_task
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
 
     async def stop(self):
         async with self._lock:
@@ -290,20 +356,25 @@ class ModelProcess:
         if self._idle_timer:
             self._idle_timer.cancel()
             self._idle_timer = None
-        if self._is_alive():
-            logger.info("Stopping model %s", self._current_model)
-            self._process.terminate()
+        proc = self._process
+        if proc is not None and proc.returncode is None:
+            logger.info(
+                "Stopping model %s", self._current_model or f"pid {proc.pid}"
+            )
+            proc.terminate()
             try:
-                await asyncio.wait_for(self._process.wait(), timeout=5)
+                await asyncio.wait_for(proc.wait(), timeout=10)
             except asyncio.TimeoutError:
                 logger.warning("Killing unresponsive process")
-                self._process.kill()
-                await self._process.wait()
-        if self._process and self._process.stderr and hasattr(self._process.stderr, "close"):
+                proc.kill()
+                await proc.wait()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
             try:
-                self._process.stderr.close()
-            except OSError:
+                await self._stderr_task
+            except (asyncio.CancelledError, Exception):
                 pass
+            self._stderr_task = None
         self._process = None
         self._port = None
         self._current_model = None
@@ -334,17 +405,24 @@ class ModelProcess:
                 timeout, lambda: asyncio.create_task(self.stop())
             )
 
-    async def _pipe_stderr(self):
-        pipe = self._process.stderr
+    async def _drain_stderr(self, proc, tail):
+        pipe = proc.stderr
         if not pipe:
             return
+        # llama.cpp logs to stderr; show it at INFO by default so it is visible
+        # without --verbose. Set "llama_log_level" in config.json to change it.
+        level = self._child_log_level()
         try:
             while True:
                 line = await pipe.readline()
                 if not line:
                     break
-                logger.warning("[llama-server] %s", line.decode().strip())
-        except Exception:
+                text = _ANSI_RE.sub("", line.decode(errors="replace")).strip()
+                if not text:
+                    continue
+                tail.append(text)
+                logger.log(level, "[llama-server] %s", text)
+        except (asyncio.CancelledError, Exception):
             pass
         finally:
             if hasattr(pipe, "close"):
@@ -352,6 +430,13 @@ class ModelProcess:
                     pipe.close()
                 except OSError:
                     pass
+
+    def _child_log_level(self):
+        name = str(self.config.get("llama_log_level", "info")).strip().upper()
+        if name in ("OFF", "NONE", "DISABLED"):
+            return logging.CRITICAL + 1
+        level = logging.getLevelName(name)
+        return level if isinstance(level, int) else logging.INFO
 
 
 class Server:
@@ -397,9 +482,11 @@ class Server:
         try:
             return await self.mp.ensure_model(model_name)
         except ValueError as exc:
+            logger.warning("Model '%s' is not configured: %s", model_name, exc)
             return web.json_response({"error": str(exc)}, status=404)
-        except (TimeoutError, Exception) as exc:
-            logger.exception("Model '%s' failed to load", model_name)
+        except Exception as exc:
+            logger.error("Model '%s' failed to load: %s", model_name, exc)
+            logger.debug("Load failure details", exc_info=True)
             return web.json_response(
                 {"error": f"model '{model_name}' failed to load: {exc}"},
                 status=503)
@@ -415,11 +502,9 @@ class Server:
             if upstream.status != 503:
                 return upstream
             err_text = await upstream.text()
+            if "loading" not in err_text.lower() or attempt == 119:
+                return upstream
             upstream.release()
-            if "loading" not in err_text.lower():
-                return upstream
-            if attempt == 119:
-                return upstream
             await asyncio.sleep(0.5)
 
     async def handle_api_chat(self, request):

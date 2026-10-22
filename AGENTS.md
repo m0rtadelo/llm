@@ -13,7 +13,7 @@ Built and smoke-tested on macOS (server + menu bar app). Ready to deploy on Wind
   - macOS/Linux: `llm` shell script (activates `.venv`, runs `~/.config/llm/llm.py`)
 - **macOS extras**: `llm_tray.py` (rumps menu bar app), `llm.app` / `llm_service.app` bundles
 - **Config dir**: `~/.config/llm/` (macOS/Linux) or `%USERPROFILE%\.config\llm\` (Windows)
-  - `config.json` — server options (port, host, idle_timeout, llama-server binary path). Set `host` to `"0.0.0.0"` to accept remote connections; `"127.0.0.1"` for local-only.
+  - `config.json` — server options (port, host, idle_timeout, load_timeout, llama_log_level, llama-server binary path). Set `host` to `"0.0.0.0"` to accept remote connections; `"127.0.0.1"` for local-only.
   - `models.json` — array of model definitions, each with `name`, `path`, and `params` (llama.cpp CLI flags per model)
 - **Port**: 11434
 - **Dependencies**: Python 3.10+, `pip install aiohttp`; macOS menu bar app also needs `rumps`

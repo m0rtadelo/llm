@@ -52,7 +52,9 @@ The server reads its configuration from `~/.config/llm/` on both platforms:
   "llama-params": [],
   "port": 11434,
   "host": "0.0.0.0",
-  "idle_timeout": 300
+  "idle_timeout": 300,
+  "load_timeout": 600,
+  "llama_log_level": "info"
 }
 ```
 
@@ -63,6 +65,8 @@ The server reads its configuration from `~/.config/llm/` on both platforms:
 | `port` | Port the proxy listens on. Default `11434`. |
 | `host` | `0.0.0.0` to accept remote connections; `127.0.0.1` for local-only. |
 | `idle_timeout` | Seconds of inactivity before the active model is unloaded. `0` disables auto-unload. |
+| `load_timeout` | Seconds to wait for `llama-server` to report healthy after spawning. Default `600`. |
+| `llama_log_level` | Log level for `llama-server` stderr output: `info` (default), `debug`, `warning`, or `off` to silence it. |
 
 ### Configuration — `models.json`
 
@@ -97,6 +101,8 @@ An array of model definitions. Each `params` entry is passed to `llama-server` a
 ```
 
 The `ctx-size` param is also reported to clients via `/api/show` as the model context length (fallback `4096`).
+
+Params are passed through verbatim, so they must exist in the `llama-server` build you run. If a flag was removed upstream, the process exits immediately and the proxy returns the child's own error. For example, recent llama.cpp builds replaced `--no-mmap` / `--mlock` with `--load-mode none|mlock|mmap|auto`.
 
 ## Running
 
