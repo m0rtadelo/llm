@@ -20,9 +20,9 @@ Built and smoke-tested on macOS (server + menu bar app). Ready to deploy on Wind
 
 ## Architecture
 
-Proxy server that manages `llama-server.exe` as subprocess:
+Proxy server that manages the configured llama.cpp executable as a subprocess:
 
-1. Spawns `llama-server.exe -m <gguf> --host 127.0.0.1 --port <random>` on first request for a model
+1. Spawns the configured executable, `llama-params`, and model arguments (for example, `llama.exe serve -m <gguf> --host 127.0.0.1 --port <random>`) on first request for a model
 2. Kills previous instance when switching models
 3. Idle timeout unloads model after N seconds of inactivity
 4. Streams requests/responses through to the child process

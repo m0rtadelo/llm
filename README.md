@@ -20,7 +20,7 @@ Point any Ollama or OpenAI-compatible client (opencode, pi.dev, Continue, editor
 
 - Python 3.10+
 - `pip install aiohttp`
-- A built `llama-server` binary (from llama.cpp) on `PATH` or referenced by full path in the config
+- A built `llama-server` binary (from llama.cpp) on `PATH` or referenced by full path in the config; alternatively, configure `llama.exe` with the `serve` subcommand
 - One or more GGUF model files
 - macOS menu bar app only: `pip install rumps`
 
@@ -49,6 +49,7 @@ The server reads its configuration from `~/.config/llm/` on both platforms:
 ```json
 {
   "llama-server": "llama-server",
+  "llama-params": [],
   "port": 11434,
   "host": "0.0.0.0",
   "idle_timeout": 300
@@ -57,7 +58,8 @@ The server reads its configuration from `~/.config/llm/` on both platforms:
 
 | Key | Description |
 |---|---|
-| `llama-server` | Command or full path to the `llama-server` binary (`llama-server.exe` on Windows). |
+| `llama-server` | Executable name or full path, such as `llama-server.exe` or `llama.exe` on Windows. |
+| `llama-params` | Array of string arguments inserted immediately after the executable and before the model arguments. Use `["serve"]` with `llama.exe` to launch the `serve` subcommand. |
 | `port` | Port the proxy listens on. Default `11434`. |
 | `host` | `0.0.0.0` to accept remote connections; `127.0.0.1` for local-only. |
 | `idle_timeout` | Seconds of inactivity before the active model is unloaded. `0` disables auto-unload. |

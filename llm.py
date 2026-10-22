@@ -26,6 +26,7 @@ logger = logging.getLogger("llm")
 CONFIG_DIR = Path.home() / ".config" / "llm"
 DEFAULT_CONFIG = {
     "llama-server": "llama-server",
+    "llama-params": [],
     "port": 11434,
     "host": "0.0.0.0",
     "idle_timeout": 300,
@@ -196,7 +197,21 @@ class ModelProcess:
 
     def _build_cmd(self, model, port):
         binary = self.config["llama-server"]
-        cmd = [binary, "-m", model["path"], "--host", "127.0.0.1", "--port", str(port)]
+        llama_params = self.config.get("llama-params", [])
+        if not isinstance(llama_params, list) or not all(
+            isinstance(param, str) for param in llama_params
+        ):
+            raise ValueError('"llama-params" must be an array of strings')
+        cmd = [
+            binary,
+            *llama_params,
+            "-m",
+            model["path"],
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
         for key, value in model.get("params", {}).items():
             flag = key if key.startswith("-") else f"--{key}"
             if isinstance(value, bool):
